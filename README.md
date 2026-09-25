@@ -1,0 +1,374 @@
+# 胶片数字化帧号复核 API
+
+按扫描顺序接收 2～100 帧的 OCR 帧号识别结果，基于动态规划为每帧指派一个
+**严格递增**的帧号：自动舍弃误识别候选、推断未识别帧、标出缺失帧号，并给出
+最优方案的代价明细。
+
+另有胶片条方向复核接口：接收按实体顺序排列的 **2～4 条胶片条**（每条至少
+1 帧、总计 2～100 帧），在“每条保持原序或整体倒序、条间顺序固定”的所有
+方向组合上做同样的最优指派，并返回选定的方向与重排结果。
+
+- 语言/框架：Python 3.12 + FastAPI + Pydantic v2
+- 算法：后缀动态规划（单调队列优化 + 字典序同分裁决）+ 方向组合枚举（最多 16 种）
+- 置信分使用 `Decimal` 精确比较（DP 内部统一放大为整数），避免浮点同分误判
+
+## 一条命令启动
+
+需要已安装 Docker（含 Compose 插件），在项目根目录执行：
+
+```bash
+docker compose up --build -d
+```
+
+一条命令即完成镜像构建、后台启动与健康检查注册，容器内、外端口均为
+`8000`。启动后可直接使用两个接口：
+
+- API 地址：`http://localhost:8000`
+- 交互式文档（Swagger UI，两个接口均可在线调试）：<http://localhost:8000/docs>
+- 健康检查：<http://localhost:8000/health>
+- 逐帧复核：`POST http://localhost:8000/api/v1/frame-reviews`
+- 胶片条方向复核：`POST http://localhost:8000/api/v1/strip-direction-reviews`
+
+停止服务：
+
+```bash
+docker compose down
+```
+
+
+## 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/v1/frame-reviews` | 逐帧复核：单条扫描序列的帧号指派 |
+| `POST` | `/api/v1/strip-direction-reviews` | 胶片条方向复核：2～4 条胶片条的方向选择与帧号指派 |
+
+### `POST /api/v1/frame-reviews`
+
+#### 请求参数
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `first` | int | 固定首帧号 |
+| `last` | int | 固定末帧号，必须严格大于 `first` |
+| `max_missing_between` | int | 相邻两帧之间最多允许缺帧数，0～10 |
+| `frames` | 数组 | 按扫描顺序排列的 2～100 帧 |
+| `frames[].id` | string \| int | 扫描帧唯一标识 |
+| `frames[].candidates` | 数组 | OCR 候选，可为空 |
+| `candidates[].frame_number` | int | OCR 识别帧号 |
+| `candidates[].confidence` | number | OCR 置信分，0～100 |
+
+#### 指派规则与代价
+
+- 第 1 帧必须指派为 `first`，最后 1 帧必须指派为 `last`；
+- 相邻指派帧号之差 ∈ `[1, max_missing_between + 1]`；
+- 命中候选代价 = `100 - 置信分`；未命中任何候选（纯推断）代价 = `100`；
+- 相邻两帧之间每缺 1 帧额外加 `30`；
+- 取总代价最小的方案；总代价相同时，取**帧号序列字典序最小**的方案；
+- 同一帧内同帧号出现多次时，仅保留置信分最高的一条（同分保留下标小者），
+  其余作为重复候选舍弃；超出 `[first, last]` 的候选也会被舍弃。
+- 在上述约束下无法形成合法序列时返回 HTTP `422`，错误体含
+  `error`（`invalid_range` / `no_feasible_sequence`）与中文 `message`。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/frame-reviews \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first": 10,
+    "last": 13,
+    "max_missing_between": 2,
+    "frames": [
+      {"id": "scan-001", "candidates": [{"frame_number": 10, "confidence": 95}]},
+      {"id": "scan-002", "candidates": [{"frame_number": 12, "confidence": 90}]},
+      {"id": "scan-003", "candidates": [
+        {"frame_number": 13, "confidence": 80},
+        {"frame_number": 99, "confidence": 70}
+      ]}
+    ]
+  }'
+```
+
+#### 响应示例
+
+```json
+{
+  "first": 10,
+  "last": 13,
+  "max_missing_between": 2,
+  "frame_count": 3,
+  "assigned_frame_numbers": [10, 12, 13],
+  "total_cost": 65,
+  "candidate_cost_total": 35,
+  "missing_penalty_total": 30,
+  "missing_frame_numbers": [11],
+  "missing_frame_count": 1,
+  "discarded_candidate_count": 1,
+  "frames": [
+    {
+      "position": 1,
+      "id": "scan-001",
+      "assigned_frame_number": 10,
+      "source": "candidate",
+      "matched_candidate_index": 0,
+      "assigned_cost": 5,
+      "missing_after": 1,
+      "missing_penalty": 30,
+      "discarded_candidates": []
+    },
+    {
+      "position": 2,
+      "id": "scan-002",
+      "assigned_frame_number": 12,
+      "source": "candidate",
+      "matched_candidate_index": 0,
+      "assigned_cost": 10,
+      "missing_after": 0,
+      "missing_penalty": 0,
+      "discarded_candidates": []
+    },
+    {
+      "position": 3,
+      "id": "scan-003",
+      "assigned_frame_number": 13,
+      "source": "candidate",
+      "matched_candidate_index": 0,
+      "assigned_cost": 20,
+      "missing_after": 0,
+      "missing_penalty": 0,
+      "discarded_candidates": [
+        {"candidate_index": 1, "frame_number": 99, "confidence": 70, "reason": "out_of_range"}
+      ]
+    }
+  ]
+}
+```
+
+舍弃候选的 `reason`：
+
+- `not_selected`：在最优方案中未被采用（典型误识别）；
+- `out_of_range`：帧号超出固定的 `[first, last]` 范围；
+- `duplicate_frame_number`：同帧内与更高置信分的候选帧号重复。
+
+#### 无合法序列示例
+
+帧号区间无法容纳全部扫描帧（如 3 帧却只给了 2 个帧号）：
+
+```json
+{
+  "error": "no_feasible_sequence",
+  "message": "帧号区间 [1, 2] 只有 2 个帧号，无法为 3 帧指派严格递增的帧号"
+}
+```
+
+### `POST /api/v1/strip-direction-reviews`
+
+#### 请求参数
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `first` | int | 固定首帧号 |
+| `last` | int | 固定末帧号，必须严格大于 `first` |
+| `max_missing_between` | int | 相邻两帧之间最多允许缺帧数，0～10 |
+| `strips` | 数组 | 按实体顺序排列的 2～4 条胶片条，**条间顺序固定** |
+| `strips[].frames` | 数组 | 该条按扫描顺序录入的帧，至少 1 帧；总计 2～100 帧 |
+| `frames[].id` | string \| int | 扫描帧唯一标识 |
+| `frames[].candidates` | 数组 | OCR 候选，可为空（结构同逐帧复核） |
+| `candidates[].frame_number` | int | OCR 识别帧号 |
+| `candidates[].confidence` | number | OCR 置信分，0～100 |
+
+每条胶片条要么**保持原序**（方向 `0`），要么**整条倒序**（方向 `1`，
+候选随帧一起翻转）。在所有 2ⁿ（n = 条数，最多 16）种方向组合上做帧号
+指派，沿用逐帧复核的全部规则：
+
+- 第 1 个重排帧固定 `first`、最后一个固定 `last`，帧号严格递增；
+- 相邻指派帧号之差 ∈ `[1, max_missing_between + 1]`；
+- 命中候选代价 = `100 - 置信分`，纯推断代价 = `100`，每缺 1 帧加 `30`。
+
+最优方案的裁决顺序（逐级字典序）：
+
+1. **总代价最小**；
+2. 总代价相同时，**倒序条数最少**；
+3. 再相同时，**方向向量字典序最小**（各条按条序，正序 `0`、倒序 `1`）；
+4. 仍相同时，全局**指派帧号序列字典序最小**。
+
+所有方向组合都不存在合法指派时返回 HTTP `422`，错误码为
+`no_feasible_combination`；参数非法为 `invalid_range`。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/strip-direction-reviews \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first": 1,
+    "last": 4,
+    "max_missing_between": 1,
+    "strips": [
+      {"frames": [
+        {"id": "A1", "candidates": [{"frame_number": 1, "confidence": 99}]},
+        {"id": "A2", "candidates": [{"frame_number": 2, "confidence": 90}]}
+      ]},
+      {"frames": [
+        {"id": "B2", "candidates": [{"frame_number": 4, "confidence": 90}]},
+        {"id": "B1", "candidates": [{"frame_number": 3, "confidence": 90}]}
+      ]}
+    ]
+  }'
+```
+
+#### 响应示例
+
+```json
+{
+  "first": 1,
+  "last": 4,
+  "max_missing_between": 1,
+  "strip_count": 2,
+  "frame_count": 4,
+  "directions": [0, 1],
+  "reversed_strip_count": 1,
+  "strip_frame_ids": [["A1", "A2"], ["B1", "B2"]],
+  "frame_ids": ["A1", "A2", "B1", "B2"],
+  "assigned_frame_numbers": [1, 2, 3, 4],
+  "total_cost": 31,
+  "candidate_cost_total": 31,
+  "missing_penalty_total": 0,
+  "missing_frame_numbers": [],
+  "missing_frame_count": 0,
+  "discarded_candidate_count": 0,
+  "strips": [
+    {
+      "index": 1,
+      "direction": 0,
+      "frame_count": 2,
+      "frame_ids": ["A1", "A2"],
+      "frames": [
+        {
+          "position": 1,
+          "id": "A1",
+          "assigned_frame_number": 1,
+          "source": "candidate",
+          "matched_candidate_index": 0,
+          "assigned_cost": 1,
+          "missing_after": 0,
+          "missing_penalty": 0,
+          "discarded_candidates": []
+        },
+        {
+          "position": 2,
+          "id": "A2",
+          "assigned_frame_number": 2,
+          "source": "candidate",
+          "matched_candidate_index": 0,
+          "assigned_cost": 10,
+          "missing_after": 0,
+          "missing_penalty": 0,
+          "discarded_candidates": []
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "direction": 1,
+      "frame_count": 2,
+      "frame_ids": ["B1", "B2"],
+      "frames": [
+        {
+          "position": 3,
+          "id": "B1",
+          "assigned_frame_number": 3,
+          "source": "candidate",
+          "matched_candidate_index": 0,
+          "assigned_cost": 10,
+          "missing_after": 0,
+          "missing_penalty": 0,
+          "discarded_candidates": []
+        },
+        {
+          "position": 4,
+          "id": "B2",
+          "assigned_frame_number": 4,
+          "source": "candidate",
+          "matched_candidate_index": 0,
+          "assigned_cost": 10,
+          "missing_after": 0,
+          "missing_penalty": 0,
+          "discarded_candidates": []
+        }
+      ]
+    }
+  ],
+  "frames": [
+    "……与 strips[].frames 内容相同，按全局 position 1～4 平铺，字段同逐帧复核"
+  ]
+}
+```
+
+字段说明：
+
+- `directions`：各条选定方向（与输入 `strips` 同序），`0`=保持原序、
+  `1`=整体倒序；`reversed_strip_count` 为其中倒序条数；
+- `strip_frame_ids` / `strips[].frame_ids`：每条按选定方向**重排后的帧
+  ID**；`frame_ids` 是全部帧拼接（条间固定顺序）后的结果；
+- `strips[].frames[]` 为该条逐帧指派，其中 `position` 是全局位置；
+  顶层 `frames` 则是全部帧按全局顺序展开的同一明细；
+- 代价汇总、`missing_*`、`discarded_candidates` 字段含义与逐帧复核一致。
+
+#### 无可行方向组合示例
+
+```json
+{
+  "error": "no_feasible_combination",
+  "message": "2 条胶片条的 4 种方向组合均无法形成合法的严格递增帧号序列"
+}
+```
+
+## 算法说明
+
+令 `span = last - first`，第 i 帧的指派帧号写作 `first + d_i`。
+合法条件：`d_0 = 0`、`d_{n-1} = span`、
+`1 ≤ d_{i+1} - d_i ≤ max_missing_between + 1`。
+
+后缀 DP（`app/solver.py`）：
+
+```
+dp[i][d] = match(i, d)
+           + min over d' ∈ [d+1, d+max_step]  (30·(d'-d-1) + dp[i+1][d'])
+
+match(i, d) = 100 - 置信分   若该帧存在帧号 first+d 的候选
+            = 100            否则（推断）
+```
+
+- 转移最小值改写为滑动窗口（`30·d' + dp[i+1][d']` 在定宽窗口内取最小），
+  用单调队列维护，单层 DP 为 O(span)，单方向组合整体
+  O(n · span)；方向组合最多 16 个；
+- 回溯时在保持最优代价的前提下每一步选最小偏移量，后缀最优与历史无关，
+  因此贪心回溯得到的就是字典序最小的最优帧号序列；
+- 胶片条方向复核把每条按候选方向翻转后拼接（条间顺序不变），对每个方向
+  向量跑一次上述 DP，再按“总代价 → 倒序条数 → 方向向量 → 帧号序列”
+  逐级取字典序最小。
+
+## 本地开发（不使用 Docker）
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+## 项目结构
+
+```
+.
+├── app/
+│   ├── __init__.py
+│   ├── main.py       # FastAPI 入口与错误处理
+│   ├── schemas.py    # Pydantic 请求/响应模型
+│   └── solver.py     # DP 核心（纯标准库，可独立调用）
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+└── README.md
+```

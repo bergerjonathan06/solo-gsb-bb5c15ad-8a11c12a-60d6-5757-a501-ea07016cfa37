@@ -1,0 +1,156 @@
+"""请求/响应数据模型（Pydantic v2）。"""
+
+from __future__ import annotations
+
+from typing import Literal, Union
+
+from pydantic import BaseModel, Field
+
+# 帧 ID 允许字符串或整数
+FrameId = Union[str, int]
+
+
+class CandidateIn(BaseModel):
+    frame_number: int = Field(..., description="OCR 识别出的帧号")
+    confidence: Union[int, float] = Field(
+        ..., ge=0, le=100, description="OCR 置信分，0～100"
+    )
+
+
+class FrameIn(BaseModel):
+    id: FrameId = Field(..., description="扫描帧的唯一标识")
+    candidates: list[CandidateIn] = Field(
+        default_factory=list, description="该帧的 OCR 候选，可为空"
+    )
+
+
+class ReviewRequest(BaseModel):
+    first: int = Field(..., description="固定首帧号")
+    last: int = Field(..., description="固定末帧号（必须严格大于 first）")
+    max_missing_between: int = Field(
+        ..., ge=0, le=10, description="相邻两帧之间最多允许缺帧的数量，0～10"
+    )
+    frames: list[FrameIn] = Field(
+        ..., min_length=2, max_length=100, description="按扫描顺序排列的 2～100 帧"
+    )
+
+
+class StripIn(BaseModel):
+    frames: list[FrameIn] = Field(
+        ..., min_length=1, description="该胶片条按扫描顺序录入的帧，至少 1 帧"
+    )
+
+
+class StripDirectionReviewRequest(BaseModel):
+    first: int = Field(..., description="固定首帧号")
+    last: int = Field(..., description="固定末帧号（必须严格大于 first）")
+    max_missing_between: int = Field(
+        ..., ge=0, le=10, description="相邻两帧之间最多允许缺帧的数量，0～10"
+    )
+    strips: list[StripIn] = Field(
+        ...,
+        min_length=2,
+        max_length=4,
+        description="按实体顺序排列的 2～4 条胶片条；每条可整体正序或倒序",
+    )
+
+
+class DiscardedCandidateOut(BaseModel):
+    candidate_index: int = Field(..., description="该候选在输入 candidates 中的下标")
+    frame_number: int
+    confidence: Union[int, float]
+    reason: Literal["duplicate_frame_number", "out_of_range", "not_selected"]
+
+
+class FrameAssignmentOut(BaseModel):
+    position: int = Field(..., description="扫描顺序位置，从 1 开始")
+    id: FrameId
+    assigned_frame_number: int = Field(..., description="指派给该帧的严格递增帧号")
+    source: Literal["candidate", "inferred"] = Field(
+        ..., description="candidate=命中 OCR 候选；inferred=未命中、按序列推断"
+    )
+    matched_candidate_index: Union[int, None] = Field(
+        ..., description="命中的候选下标；推断时为 null"
+    )
+    assigned_cost: Union[int, float] = Field(
+        ..., description="该帧的指派代价（命中=100-置信分，推断=100）"
+    )
+    missing_after: int = Field(..., description="该帧与下一帧之间缺了多少帧")
+    missing_penalty: int = Field(..., description="上述缺帧产生的代价（30/帧）")
+    discarded_candidates: list[DiscardedCandidateOut]
+
+
+class ReviewResponse(BaseModel):
+    first: int
+    last: int
+    max_missing_between: int
+    frame_count: int
+    assigned_frame_numbers: list[int] = Field(
+        ..., description="与输入 frames 等长、严格递增的指派帧号序列"
+    )
+    total_cost: Union[int, float]
+    candidate_cost_total: Union[int, float]
+    missing_penalty_total: Union[int, float]
+    missing_frame_numbers: list[int] = Field(
+        ..., description="[first, last] 内未指派给任何扫描帧的缺失帧号"
+    )
+    missing_frame_count: int
+    discarded_candidate_count: int
+    frames: list[FrameAssignmentOut]
+
+
+class StripAssignmentOut(BaseModel):
+    index: int = Field(..., description="胶片条序号，从 1 开始（条间顺序固定）")
+    direction: Literal[0, 1] = Field(
+        ..., description="选定方向：0=保持原序，1=整体倒序"
+    )
+    frame_count: int = Field(..., description="该条胶片条的帧数")
+    frame_ids: list[FrameId] = Field(
+        ..., description="按选定方向重排后的帧 ID（条内扫描顺序）"
+    )
+    frames: list[FrameAssignmentOut] = Field(
+        ..., description="该条各帧的逐帧指派（position 为全局位置）"
+    )
+
+
+class StripDirectionReviewResponse(BaseModel):
+    first: int
+    last: int
+    max_missing_between: int
+    strip_count: int
+    frame_count: int
+    directions: list[Literal[0, 1]] = Field(
+        ...,
+        description="各条选定方向（0=正序，1=倒序），下标与 strips 对应",
+    )
+    reversed_strip_count: int = Field(..., description="选定为倒序的胶片条数量")
+    strip_frame_ids: list[list[FrameId]] = Field(
+        ..., description="逐条约为 [条][重排后条内帧序] 的帧 ID 二维数组"
+    )
+    frame_ids: list[FrameId] = Field(
+        ..., description="按条间顺序与各条选定方向重排后的全部帧 ID"
+    )
+    assigned_frame_numbers: list[int] = Field(
+        ..., description="与 frame_ids 等长、严格递增的全局指派帧号序列"
+    )
+    total_cost: Union[int, float]
+    candidate_cost_total: Union[int, float]
+    missing_penalty_total: Union[int, float]
+    missing_frame_numbers: list[int] = Field(
+        ..., description="[first, last] 内未指派给任何扫描帧的缺失帧号"
+    )
+    missing_frame_count: int
+    discarded_candidate_count: int
+    strips: list[StripAssignmentOut] = Field(
+        ..., description="逐条方向、重排帧 ID 与逐帧指派"
+    )
+    frames: list[FrameAssignmentOut] = Field(
+        ..., description="全部帧按全局顺序展开的逐帧指派与代价明细"
+    )
+
+
+class ErrorResponse(BaseModel):
+    error: Literal[
+        "invalid_range", "no_feasible_sequence", "no_feasible_combination"
+    ]
+    message: str
