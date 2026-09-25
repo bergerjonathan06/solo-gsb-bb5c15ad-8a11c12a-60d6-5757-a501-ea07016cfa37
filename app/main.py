@@ -7,6 +7,8 @@ from fastapi.responses import JSONResponse
 
 from app.schemas import (
     ErrorResponse,
+    RescanPlanRequest,
+    RescanPlanResponse,
     ReviewRequest,
     ReviewResponse,
     StripDirectionReviewRequest,
@@ -16,6 +18,7 @@ from app.solver import (
     InvalidRangeError,
     NoFeasibleCombinationError,
     NoFeasibleSequenceError,
+    solve_rescan_plan,
     solve_review,
     solve_strip_directions,
 )
@@ -27,8 +30,10 @@ app = FastAPI(
         "帧号，舍弃误识别候选并推断未识别帧，输出缺失帧号与代价明细。"
         "并支持 2～4 条胶片条的方向复核：枚举各条正序/倒序组合，"
         "在合法指派中取总代价最小的方案。"
+        "复扫规划在复核结果上合并缺失帧与推断帧，按窗口长度与准备成本"
+        "求覆盖全部复扫目标的最低成本窗口方案。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -77,6 +82,19 @@ async def health() -> dict[str, str]:
 async def review_frames(request: ReviewRequest) -> ReviewResponse:
     result = solve_review(request.model_dump())
     return ReviewResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/rescan-plans",
+    response_model=RescanPlanResponse,
+    tags=["review"],
+    summary="规划缺失帧与推断帧的复扫窗口",
+    responses={422: {"model": ErrorResponse, "description": "参数非法或无合法序列"}},
+)
+async def plan_rescan(request: RescanPlanRequest) -> RescanPlanResponse:
+    # 复核阶段完全复用 solve_review，沿用其全部校验与错误语义
+    result = solve_rescan_plan(request.model_dump())
+    return RescanPlanResponse.model_validate(result)
 
 
 @app.post(

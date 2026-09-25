@@ -529,6 +529,166 @@ def solve_review(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---- 复扫窗口规划 ----
+
+# 复扫窗口参数边界
+MIN_WINDOW_LENGTH = 1
+MAX_WINDOW_LENGTH = 50
+MIN_SETUP_COST = 0
+MAX_SETUP_COST = 1000
+
+
+def _validate_rescan_options(payload: dict[str, Any]) -> tuple[int, int]:
+    """校验并返回 (max_window_length, setup_cost)。"""
+    window = payload.get("max_window_length")
+    setup = payload.get("setup_cost")
+    if (
+        not isinstance(window, int)
+        or isinstance(window, bool)
+        or not (MIN_WINDOW_LENGTH <= window <= MAX_WINDOW_LENGTH)
+    ):
+        raise InvalidRangeError(
+            f"max_window_length 必须是 {MIN_WINDOW_LENGTH}～{MAX_WINDOW_LENGTH} 的整数"
+        )
+    if (
+        not isinstance(setup, int)
+        or isinstance(setup, bool)
+        or not (MIN_SETUP_COST <= setup <= MAX_SETUP_COST)
+    ):
+        raise InvalidRangeError(
+            f"setup_cost 必须是 {MIN_SETUP_COST}～{MAX_SETUP_COST} 的整数"
+        )
+    return window, setup
+
+
+def _partition_rescan_targets(
+    targets: list[int], max_window_length: int, setup_cost: int
+) -> tuple[int, tuple[tuple[int, int], ...]]:
+    """把有序目标帧号划分为互不重叠的连续窗口，求最低总成本方案。
+
+    每个窗口恰好覆盖连续的一段目标 ``targets[i..j-1]``，区间为
+    ``[targets[i], targets[j-1]]``（向目标外延伸只会增加长度成本、压缩
+    其他窗口空间，不可能更优），要求区间长度不超过 max_window_length；
+    单窗成本 = setup_cost + 区间长度。
+
+    前缀 DP：
+        dp[k] = 覆盖前 k 个目标的最优方案
+                = (总成本, 窗口数, (起点1, 终点1, 起点2, 终点2, ...))
+        dp[k] = min over i 满足 targets[k-1]-targets[i]+1 <= L of
+                dp[i] + (setup + 长度, 1 个窗口, (targets[i], targets[k-1]))
+
+    裁决键按元组自然比较即与需求一致：总成本最小 → 窗口数最少 →
+    起止点扁平序列字典序最小。同分裁决具备最优子结构：成本与窗口数均可
+    加；而所有同分方案窗口数相同（端点序列等长），前缀的字典序大小关系
+    在追加相同尾窗后保持不变。
+
+    返回 (总成本, ((start, end), ...))；调用方保证 targets 非空（L >= 1，
+    单个目标总能成窗，故每个状态均可行）。
+    """
+    m = len(targets)
+    # 每项 (总成本, 窗口数, 扁平化起止点序列)
+    dp: list[tuple[int, int, tuple[int, ...]]] = [(0, 0, ())]
+    for k in range(1, m + 1):
+        end = targets[k - 1]
+        best: tuple[int, int, tuple[int, ...]] | None = None
+        # i 越小窗口越长，超长后更小的 i 也不可能合法，直接终止
+        for i in range(k - 1, -1, -1):
+            start = targets[i]
+            length = end - start + 1
+            if length > max_window_length:
+                break
+            prefix_cost, prefix_count, prefix_points = dp[i]
+            candidate: tuple[int, int, tuple[int, ...]] = (
+                prefix_cost + setup_cost + length,
+                prefix_count + 1,
+                prefix_points + (start, end),
+            )
+            if best is None or candidate < best:
+                best = candidate
+        assert best is not None, "复扫目标划分必存在可行方案"
+        dp.append(best)
+
+    total_cost, _window_count, points = dp[m]
+    windows = tuple(
+        (points[p], points[p + 1]) for p in range(0, len(points), 2)
+    )
+    return total_cost, windows
+
+
+def solve_rescan_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    """执行复扫窗口规划。
+
+    入参在逐帧复核请求（first / last / max_missing_between / frames）之外
+    增加：
+        max_window_length: int，1～50，单个复扫窗口的最大帧号长度
+        setup_cost: int，0～1000，每个窗口的固定准备成本
+
+    先复用 :func:`solve_review` 完成帧号指派（沿用其全部校验与错误语义），
+    取复核结果中的缺失帧号与 source=inferred 的指派帧号，合并去重得到
+    复扫目标；再把目标划成互不重叠的连续窗口：单窗成本为
+    setup_cost + 窗口帧号数，取总成本最低方案，同成本依次按窗口数最少、
+    起止点序列字典序最小裁决。没有复扫目标时返回空窗口与零成本。
+    """
+    review = solve_review(payload)
+    max_window_length, setup_cost = _validate_rescan_options(payload)
+
+    missing_numbers = list(review["missing_frame_numbers"])
+    missing_set = set(missing_numbers)
+
+    # 指派帧号严格递增，同一帧号至多对应一个推断帧；仍用 list 兜底去重
+    inferred_by_number: dict[int, list[Any]] = {}
+    for frame in review["frames"]:
+        if frame["source"] == "inferred":
+            inferred_by_number.setdefault(
+                frame["assigned_frame_number"], []
+            ).append(frame["id"])
+
+    target_set = missing_set | set(inferred_by_number)
+    targets = sorted(target_set)
+
+    windows_out: list[dict[str, Any]] = []
+    total_cost = 0
+    if targets:
+        total_cost, windows = _partition_rescan_targets(
+            targets, max_window_length, setup_cost
+        )
+        for index, (start, end) in enumerate(windows, start=1):
+            length = end - start + 1
+            window_missing = [
+                number for number in range(start, end + 1) if number in missing_set
+            ]
+            inferred_ids: list[Any] = []
+            for number in range(start, end + 1):
+                inferred_ids.extend(inferred_by_number.get(number, ()))
+            windows_out.append(
+                {
+                    "index": index,
+                    "start_frame_number": start,
+                    "end_frame_number": end,
+                    "length": length,
+                    "missing_frame_numbers": window_missing,
+                    "inferred_frame_ids": inferred_ids,
+                    "window_cost": setup_cost + length,
+                }
+            )
+
+    return {
+        "first": review["first"],
+        "last": review["last"],
+        "max_missing_between": review["max_missing_between"],
+        "frame_count": review["frame_count"],
+        "max_window_length": max_window_length,
+        "setup_cost": setup_cost,
+        "target_frame_numbers": targets,
+        "target_count": len(targets),
+        "missing_frame_count": len(target_set & missing_set),
+        "inferred_frame_count": len(inferred_by_number),
+        "window_count": len(windows_out),
+        "total_cost": total_cost,
+        "windows": windows_out,
+    }
+
+
 def _parse_strips(
     strips: Any,
 ) -> list[list[tuple[Any, list[dict[str, Any]]]]]:

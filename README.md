@@ -8,8 +8,13 @@
 1 帧、总计 2～100 帧），在“每条保持原序或整体倒序、条间顺序固定”的所有
 方向组合上做同样的最优指派，并返回选定的方向与重排结果。
 
+还有复扫规划接口：在逐帧复核结果上取**缺失帧号**与 `source=inferred` 的
+**推断帧号**，合并去重为复扫目标，将其划分为若干互不重叠的连续帧号窗口，
+在单窗长度上限与固定准备成本下求覆盖全部目标的**最低总成本**窗口方案。
+
 - 语言/框架：Python 3.12 + FastAPI + Pydantic v2
 - 算法：后缀动态规划（单调队列优化 + 字典序同分裁决）+ 方向组合枚举（最多 16 种）
+  + 复扫窗口前缀动态规划（字典序同分裁决）
 - 置信分使用 `Decimal` 精确比较（DP 内部统一放大为整数），避免浮点同分误判
 
 ## 一条命令启动
@@ -21,12 +26,13 @@ docker compose up --build -d
 ```
 
 一条命令即完成镜像构建、后台启动与健康检查注册，容器内、外端口均为
-`8000`。启动后可直接使用两个接口：
+`8000`。启动后可直接使用三个接口：
 
 - API 地址：`http://localhost:8000`
-- 交互式文档（Swagger UI，两个接口均可在线调试）：<http://localhost:8000/docs>
+- 交互式文档（Swagger UI，三个接口均可在线调试）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
 - 逐帧复核：`POST http://localhost:8000/api/v1/frame-reviews`
+- 复扫规划：`POST http://localhost:8000/api/v1/rescan-plans`
 - 胶片条方向复核：`POST http://localhost:8000/api/v1/strip-direction-reviews`
 
 停止服务：
@@ -41,6 +47,7 @@ docker compose down
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/v1/frame-reviews` | 逐帧复核：单条扫描序列的帧号指派 |
+| `POST` | `/api/v1/rescan-plans` | 复扫规划：覆盖缺失帧与推断帧的最低成本窗口方案 |
 | `POST` | `/api/v1/strip-direction-reviews` | 胶片条方向复核：2～4 条胶片条的方向选择与帧号指派 |
 
 ### `POST /api/v1/frame-reviews`
@@ -161,6 +168,113 @@ curl -s -X POST http://localhost:8000/api/v1/frame-reviews \
   "message": "帧号区间 [1, 2] 只有 2 个帧号，无法为 3 帧指派严格递增的帧号"
 }
 ```
+
+### `POST /api/v1/rescan-plans`
+
+在逐帧复核请求之上增加两个窗口参数。服务端先完整执行一遍逐帧复核
+（与 `/api/v1/frame-reviews` 完全相同的指派、校验与错误语义），取：
+
+- **缺失帧号**：`[first, last]` 内未指派给任何扫描帧的帧号；
+- **推断帧号**：逐帧结果中 `source = "inferred"` 的指派帧号（附对应帧 ID）。
+
+两者**合并去重**后按帧号升序作为复扫目标，再将目标划成若干
+**互不重叠、按帧号升序的连续窗口**（窗口起止点均为目标帧号；向目标外
+延伸只会增加成本，不会出现在最优方案中）。
+
+#### 请求参数
+
+逐帧复核的全部字段（`first` / `last` / `max_missing_between` / `frames`）外加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `max_window_length` | int | 单个窗口允许的最大帧号长度（`end - start + 1`），1～50 |
+| `setup_cost` | int | 每个窗口的固定准备成本，0～1000 |
+
+#### 成本与裁决
+
+- 单窗成本 = `setup_cost + 窗口帧号数`（窗口帧号数含区间内的非目标帧号）；
+- 目标：覆盖全部复扫目标的**总成本最低**；
+- 总成本相同时，**窗口数更少**者优先；
+- 仍相同时，窗口**起止点序列（起点1、终点1、起点2、终点2……）字典序
+  更小**者优先；
+- 没有复扫目标（既无缺失帧也无推断帧）时返回空窗口数组与零成本。
+
+参数非法（`invalid_range`）或无合法指派（`no_feasible_sequence`）时同样
+返回 HTTP `422`，错误体与逐帧复核一致。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/rescan-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first": 10,
+    "last": 17,
+    "max_missing_between": 3,
+    "max_window_length": 4,
+    "setup_cost": 5,
+    "frames": [
+      {"id": "scan-001", "candidates": [{"frame_number": 10, "confidence": 95}]},
+      {"id": "scan-002", "candidates": [{"frame_number": 12, "confidence": 90}]},
+      {"id": "scan-003", "candidates": []},
+      {"id": "scan-004", "candidates": [{"frame_number": 17, "confidence": 80}]}
+    ]
+  }'
+```
+
+上例复核结果为：第 3 帧无候选，指派帧号 `13`（推断）；缺失帧号为
+`11、14、15、16`。复扫目标为 `11、13、14、15、16`。
+
+#### 响应示例
+
+```json
+{
+  "first": 10,
+  "last": 17,
+  "max_missing_between": 3,
+  "frame_count": 4,
+  "max_window_length": 4,
+  "setup_cost": 5,
+  "target_frame_numbers": [11, 13, 14, 15, 16],
+  "target_count": 5,
+  "missing_frame_count": 4,
+  "inferred_frame_count": 1,
+  "window_count": 2,
+  "total_cost": 15,
+  "windows": [
+    {
+      "index": 1,
+      "start_frame_number": 11,
+      "end_frame_number": 11,
+      "length": 1,
+      "missing_frame_numbers": [11],
+      "inferred_frame_ids": [],
+      "window_cost": 6
+    },
+    {
+      "index": 2,
+      "start_frame_number": 13,
+      "end_frame_number": 16,
+      "length": 4,
+      "missing_frame_numbers": [14, 15, 16],
+      "inferred_frame_ids": ["scan-003"],
+      "window_cost": 9
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `target_frame_numbers`：缺失帧号与推断帧号合并去重后的全部复扫目标；
+  `missing_frame_count` / `inferred_frame_count` 分别为其中两类的数量
+  （两类帧号天然不相交）；
+- `windows[].start_frame_number` / `end_frame_number`：窗口起止帧号（含端点）；
+  `length` 为窗口帧号长度，必须不超过 `max_window_length`；
+- `windows[].missing_frame_numbers`：该窗覆盖的缺失帧号；
+  `windows[].inferred_frame_ids`：该窗覆盖的推断帧 ID，按帧号升序；
+- `windows[].window_cost` = `setup_cost + length`；顶层
+  `total_cost` 为各窗成本之和，无复扫目标时为 `0`、`windows` 为 `[]`。
 
 ### `POST /api/v1/strip-direction-reviews`
 
@@ -349,6 +463,22 @@ match(i, d) = 100 - 置信分   若该帧存在帧号 first+d 的候选
 - 胶片条方向复核把每条按候选方向翻转后拼接（条间顺序不变），对每个方向
   向量跑一次上述 DP，再按“总代价 → 倒序条数 → 方向向量 → 帧号序列”
   逐级取字典序最小。
+
+复扫窗口规划（`solve_rescan_plan`）先复用上述复核得到复扫目标
+`t₁ < t₂ < … < tₘ`，窗口起止点必为目标帧号。设窗口长度上限 `L`、
+准备成本 `S`，以前缀 DP 求解：
+
+```
+dp[k] = 覆盖前 k 个目标的最优方案
+dp[k] = min over i 满足 t[k-1] - t[i] + 1 ≤ L  of
+        dp[i] + (S + t[k-1] - t[i] + 1，新增 1 个窗口 (t[i], t[k-1]))
+```
+
+每个状态的裁决键为 `(总成本, 窗口数, (起点1,终点1,起点2,终点2,…))`，
+元组按自然字典序比较，恰好实现“总成本最低 → 窗口数最少 → 起止点序列
+字典序最小”的裁决。复杂度 O(m²)，而目标数最多为帧号区间长度
+（≤ 999 + 100，工程规模下可忽略）。`m = 0`（无复扫目标）时直接返回
+空窗口与零成本，不进入 DP。
 
 ## 本地开发（不使用 Docker）
 

@@ -35,6 +35,17 @@ class ReviewRequest(BaseModel):
     )
 
 
+class RescanPlanRequest(ReviewRequest):
+    """复扫窗口规划请求：在逐帧复核请求上增加窗口参数。"""
+
+    max_window_length: int = Field(
+        ..., ge=1, le=50, description="单个复扫窗口允许的最大帧号长度，1～50"
+    )
+    setup_cost: int = Field(
+        ..., ge=0, le=1000, description="每个复扫窗口的固定准备成本，0～1000"
+    )
+
+
 class StripIn(BaseModel):
     frames: list[FrameIn] = Field(
         ..., min_length=1, description="该胶片条按扫描顺序录入的帧，至少 1 帧"
@@ -146,6 +157,55 @@ class StripDirectionReviewResponse(BaseModel):
     )
     frames: list[FrameAssignmentOut] = Field(
         ..., description="全部帧按全局顺序展开的逐帧指派与代价明细"
+    )
+
+
+class RescanWindowOut(BaseModel):
+    index: int = Field(..., description="窗口序号，从 1 开始，按帧号升序")
+    start_frame_number: int = Field(..., description="窗口起始帧号（含）")
+    end_frame_number: int = Field(..., description="窗口结束帧号（含）")
+    length: int = Field(
+        ..., description="窗口帧号长度 = end_frame_number - start_frame_number + 1"
+    )
+    missing_frame_numbers: list[int] = Field(
+        ..., description="该窗口覆盖的缺失帧号（有序）"
+    )
+    inferred_frame_ids: list[FrameId] = Field(
+        ...,
+        description=(
+            "该窗口覆盖的 source=inferred 推断帧 ID，按帧号升序；"
+            "推断帧号不会与缺失帧号重复"
+        ),
+    )
+    window_cost: int = Field(
+        ..., description="该窗口成本 = setup_cost + length"
+    )
+
+
+class RescanPlanResponse(BaseModel):
+    first: int
+    last: int
+    max_missing_between: int
+    frame_count: int
+    max_window_length: int
+    setup_cost: int
+    target_frame_numbers: list[int] = Field(
+        ...,
+        description="缺失帧号与推断帧号合并去重后的全部复扫目标帧号（有序）",
+    )
+    target_count: int
+    missing_frame_count: int = Field(..., description="复扫目标中的缺失帧号数量")
+    inferred_frame_count: int = Field(..., description="复扫目标中的推断帧数量")
+    window_count: int
+    total_cost: int = Field(
+        ...,
+        description=(
+            "全部窗口成本之和 = window_count*setup_cost + 各窗 length 之和；"
+            "没有复扫目标时为 0"
+        ),
+    )
+    windows: list[RescanWindowOut] = Field(
+        ..., description="互不重叠、按帧号升序的复扫窗口；无目标时为空数组"
     )
 
 
