@@ -8,8 +8,14 @@
 1 帧、总计 2～100 帧），在“每条保持原序或整体倒序、条间顺序固定”的所有
 方向组合上做同样的最优指派，并返回选定的方向与重排结果。
 
+另有复扫窗口规划接口：在逐帧复核结果之上，把**缺失帧号**与**推断帧**
+（`source=inferred`）的指派帧号合并去重为复扫目标，划分成若干互不重叠、
+长度受限的连续帧号窗口（每窗成本 = 固定成本 + 窗口帧号数），求覆盖全部
+目标的最低总成本方案。
+
 - 语言/框架：Python 3.12 + FastAPI + Pydantic v2
 - 算法：后缀动态规划（单调队列优化 + 字典序同分裁决）+ 方向组合枚举（最多 16 种）
+  + 复扫窗口划分动态规划
 - 置信分使用 `Decimal` 精确比较（DP 内部统一放大为整数），避免浮点同分误判
 
 ## 一条命令启动
@@ -21,13 +27,14 @@ docker compose up --build -d
 ```
 
 一条命令即完成镜像构建、后台启动与健康检查注册，容器内、外端口均为
-`8000`。启动后可直接使用两个接口：
+`8000`。启动后可直接使用三个接口：
 
 - API 地址：`http://localhost:8000`
-- 交互式文档（Swagger UI，两个接口均可在线调试）：<http://localhost:8000/docs>
+- 交互式文档（Swagger UI，三个接口均可在线调试）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
 - 逐帧复核：`POST http://localhost:8000/api/v1/frame-reviews`
 - 胶片条方向复核：`POST http://localhost:8000/api/v1/strip-direction-reviews`
+- 复扫窗口规划：`POST http://localhost:8000/api/v1/rescan-plans`
 
 停止服务：
 
@@ -42,6 +49,7 @@ docker compose down
 | --- | --- | --- |
 | `POST` | `/api/v1/frame-reviews` | 逐帧复核：单条扫描序列的帧号指派 |
 | `POST` | `/api/v1/strip-direction-reviews` | 胶片条方向复核：2～4 条胶片条的方向选择与帧号指派 |
+| `POST` | `/api/v1/rescan-plans` | 复扫窗口规划：把缺失/推断帧号划分为最低成本的连续窗口 |
 
 ### `POST /api/v1/frame-reviews`
 
@@ -325,6 +333,104 @@ curl -s -X POST http://localhost:8000/api/v1/strip-direction-reviews \
 }
 ```
 
+### `POST /api/v1/rescan-plans`
+
+在逐帧复核结果之上规划复扫窗口：取复核得到的**缺失帧号**与
+**`source=inferred` 帧的指派帧号**，合并去重为复扫目标，再把目标划分成
+若干互不重叠的连续帧号窗口，使总成本最低。
+
+#### 请求参数
+
+包含逐帧复核的全部字段（`first` / `last` / `max_missing_between` /
+`frames`，含义与校验规则相同），另加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `max_window_length` | int | 单个复扫窗口最多覆盖的连续帧号数，1～50 |
+| `setup_cost` | number | 每开启一个复扫窗口的固定成本，0～1000 |
+
+#### 窗口划分规则与成本
+
+- 复扫目标 = 缺失帧号 ∪ 推断帧（`source=inferred`）的指派帧号
+  （二者天然互斥，合并后去重、升序）；
+- 每个窗口是一段连续帧号区间 `[start, end]`，长度
+  `end - start + 1 ≤ max_window_length`；窗口之间互不重叠，且全部目标
+  都被某个窗口覆盖；
+- 每窗成本 = `setup_cost + 窗口帧号数`，总成本为各窗成本之和；
+- 最优窗口的起止帧号必然都是目标帧号（把窗口收紧到窗内首个/末个目标
+  只会更便宜），因此等价于把有序目标划分成若干连续段；
+- 裁决顺序：**总成本最小** → **窗口数最少** → **窗口起止点序列字典序
+  最小**；
+- 没有复扫目标时返回空 `windows` 与 `total_cost = 0`；
+- 错误语义与逐帧复核一致：参数非法返回 `invalid_range`、约束下无合法
+  序列返回 `no_feasible_sequence`（均为 HTTP `422`）。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/rescan-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first": 10,
+    "last": 16,
+    "max_missing_between": 2,
+    "max_window_length": 3,
+    "setup_cost": 10,
+    "frames": [
+      {"id": "scan-001", "candidates": [{"frame_number": 10, "confidence": 95}]},
+      {"id": "scan-002", "candidates": [{"frame_number": 12, "confidence": 90}]},
+      {"id": "scan-003", "candidates": []},
+      {"id": "scan-004", "candidates": [{"frame_number": 16, "confidence": 85}]}
+    ]
+  }'
+```
+
+该例的复核结果为 `scan-003` 被推断为帧号 13（`source=inferred`），缺失
+帧号为 11、14、15，合并去重后的复扫目标即 `[11, 13, 14, 15]`。
+
+#### 响应示例
+
+```json
+{
+  "max_window_length": 3,
+  "setup_cost": 10,
+  "target_frame_numbers": [11, 13, 14, 15],
+  "target_count": 4,
+  "window_count": 2,
+  "total_cost": 24,
+  "windows": [
+    {
+      "start": 11,
+      "end": 11,
+      "length": 1,
+      "cost": 11,
+      "missing_frame_numbers": [11],
+      "inferred_frame_ids": []
+    },
+    {
+      "start": 13,
+      "end": 15,
+      "length": 3,
+      "cost": 13,
+      "missing_frame_numbers": [14, 15],
+      "inferred_frame_ids": ["scan-003"]
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `target_frame_numbers` / `target_count`：合并去重后的复扫目标及其数量；
+- `windows[].start` / `end`：窗口起止帧号（均含），`length` 为窗口覆盖的
+  帧号数（`end - start + 1`），`cost` 为该窗成本
+  （`setup_cost + length`）；
+- `windows[].missing_frame_numbers`：该窗所含的缺失帧号（升序）；
+- `windows[].inferred_frame_ids`：该窗所含推断帧的帧 ID（按指派帧号
+  升序）；
+- `total_cost`：全部窗口成本之和；无复扫目标时 `windows` 为空、
+  `total_cost` 为 `0`。
+
 ## 算法说明
 
 令 `span = last - first`，第 i 帧的指派帧号写作 `first + d_i`。
@@ -349,6 +455,16 @@ match(i, d) = 100 - 置信分   若该帧存在帧号 first+d 的候选
 - 胶片条方向复核把每条按候选方向翻转后拼接（条间顺序不变），对每个方向
   向量跑一次上述 DP，再按“总代价 → 倒序条数 → 方向向量 → 帧号序列”
   逐级取字典序最小。
+
+复扫窗口规划（`solve_rescan_plan`）：
+
+- 最优窗口的起止必然落在目标帧号上，问题等价于把 m 个有序目标划分为
+  连续段，且每段对应的帧号跨度 ≤ `max_window_length`；
+- `dp[j]` 记录覆盖前 j 个目标的最优键 `(总成本, 窗口数, 起止点序列)`，
+  转移时枚举最后一窗的起点，三元组直接按裁决顺序比较（向前缀追加同一
+  窗口时该序保持单调，故子问题最优可转移），复杂度
+  `O(m · max_window_length)`；
+- `setup_cost` 与窗口成本同样用 `Decimal` 精确计算。
 
 ## 本地开发（不使用 Docker）
 

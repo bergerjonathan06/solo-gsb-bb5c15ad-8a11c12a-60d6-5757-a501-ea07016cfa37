@@ -55,6 +55,23 @@ class StripDirectionReviewRequest(BaseModel):
     )
 
 
+class RescanPlanRequest(BaseModel):
+    first: int = Field(..., description="固定首帧号")
+    last: int = Field(..., description="固定末帧号（必须严格大于 first）")
+    max_missing_between: int = Field(
+        ..., ge=0, le=10, description="相邻两帧之间最多允许缺帧的数量，0～10"
+    )
+    frames: list[FrameIn] = Field(
+        ..., min_length=2, max_length=100, description="按扫描顺序排列的 2～100 帧"
+    )
+    max_window_length: int = Field(
+        ..., ge=1, le=50, description="单个复扫窗口最多覆盖的连续帧号数，1～50"
+    )
+    setup_cost: Union[int, float] = Field(
+        ..., ge=0, le=1000, description="每开启一个复扫窗口的固定成本，0～1000"
+    )
+
+
 class DiscardedCandidateOut(BaseModel):
     candidate_index: int = Field(..., description="该候选在输入 candidates 中的下标")
     frame_number: int
@@ -146,6 +163,38 @@ class StripDirectionReviewResponse(BaseModel):
     )
     frames: list[FrameAssignmentOut] = Field(
         ..., description="全部帧按全局顺序展开的逐帧指派与代价明细"
+    )
+
+
+class RescanWindowOut(BaseModel):
+    start: int = Field(..., description="窗口起始帧号（含）")
+    end: int = Field(..., description="窗口结束帧号（含）")
+    length: int = Field(..., description="窗口覆盖的帧号数 = end - start + 1")
+    cost: Union[int, float] = Field(
+        ..., description="该窗成本 = setup_cost + 窗口帧号数"
+    )
+    missing_frame_numbers: list[int] = Field(
+        ..., description="该窗所含的缺失帧号，升序"
+    )
+    inferred_frame_ids: list[FrameId] = Field(
+        ...,
+        description="该窗所含推断帧（source=inferred）的帧 ID，按指派帧号升序",
+    )
+
+
+class RescanPlanResponse(BaseModel):
+    max_window_length: int
+    setup_cost: Union[int, float]
+    target_frame_numbers: list[int] = Field(
+        ..., description="缺失帧号与推断帧号合并去重后的复扫目标，升序"
+    )
+    target_count: int
+    window_count: int
+    total_cost: Union[int, float] = Field(
+        ..., description="全部窗口成本之和；无复扫目标时为 0"
+    )
+    windows: list[RescanWindowOut] = Field(
+        ..., description="互不重叠的连续复扫窗口；无复扫目标时为空数组"
     )
 
 

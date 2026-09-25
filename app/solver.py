@@ -17,6 +17,10 @@
 胶片条各自的方向（原序 / 整条倒序），条间顺序固定，在所有方向组合的合法
 指派中按总代价、倒序条数、方向向量、指派帧号序列依次裁决。
 
+复扫窗口规划（:func:`solve_rescan_plan`）复用复核结果，把缺失帧号与
+source=inferred 帧的指派帧号合并去重为复扫目标，再划分成互不重叠、
+长度受限的连续帧号窗口，按总成本、窗口数、起止点序列依次裁决。
+
 实现思路
 --------
 令 span = last - first，第 i 帧（0-based）指派到 first + d_i。
@@ -70,6 +74,12 @@ MAX_MISSING_GAP = 10
 MIN_STRIPS = 2
 MAX_STRIPS = 4
 
+# 复扫窗口规划的边界
+MIN_WINDOW_LENGTH = 1
+MAX_WINDOW_LENGTH = 50
+MIN_SETUP_COST = Decimal("0")
+MAX_SETUP_COST = Decimal("1000")
+
 # 方向编码：正序=0，倒序=1
 DIRECTION_FORWARD = 0
 DIRECTION_REVERSED = 1
@@ -99,14 +109,16 @@ class NoFeasibleCombinationError(ReviewError):
     code = "no_feasible_combination"
 
 
-def _to_decimal(value: Any, field: str) -> Decimal:
+def _to_decimal(value: Any, field: str, range_desc: str = "0～100") -> Decimal:
     """把 JSON 中的数字转成 Decimal；拒绝 NaN/Infinity 等非法数值。"""
     try:
         result = Decimal(str(value))
     except Exception as exc:  # noqa: BLE001 - 统一转成业务错误
-        raise InvalidRangeError(f"{field} 必须是 0～100 之间的有限数值") from exc
+        raise InvalidRangeError(
+            f"{field} 必须是 {range_desc} 之间的有限数值"
+        ) from exc
     if not result.is_finite():
-        raise InvalidRangeError(f"{field} 必须是 0～100 之间的有限数值")
+        raise InvalidRangeError(f"{field} 必须是 {range_desc} 之间的有限数值")
     return result
 
 
@@ -684,4 +696,142 @@ def solve_strip_directions(payload: dict[str, Any]) -> dict[str, Any]:
         "discarded_candidate_count": total_discarded,
         "strips": result_strips,
         "frames": all_frames,
+    }
+
+
+# ---- 复扫窗口规划 ----
+
+
+def _plan_windows(
+    targets: list[int],
+    max_window_length: int,
+    setup_cost: Decimal,
+) -> tuple[Decimal, list[tuple[int, int]]]:
+    """把升序去重的目标帧号划分为互不重叠的连续窗口。
+
+    每窗长度（end - start + 1）不超过 ``max_window_length``，成本为
+    ``setup_cost + 窗口帧号数``。返回 (最低总成本, [(start, end), ...])；
+    同成本时依次取窗口数更少、起止点序列字典序更小的方案。
+
+    最优解的窗口起止必然都是目标帧号（把窗口收紧到窗内首个/末个目标
+    只会更便宜），因此问题等价于把有序目标划分成若干连续段，且段对应
+    的帧号跨度受限。dp[j] 记录覆盖前 j 个目标的最优键
+    (成本, 窗口数, 起止序列)，三元组按裁决顺序直接比较；向前缀最优键
+    追加同一窗口时该序保持单调，故子问题最优可转移。
+    """
+    m = len(targets)
+    if m == 0:
+        return Decimal(0), []
+
+    # dp[j] = 覆盖 targets[:j] 的最优键 (成本, 窗口数, 窗口起止序列)
+    dp: list[tuple[Decimal, int, tuple[tuple[int, int], ...]] | None] = [
+        None
+    ] * (m + 1)
+    dp[0] = (Decimal(0), 0, ())
+    for j in range(1, m + 1):
+        end = targets[j - 1]
+        best: tuple[Decimal, int, tuple[tuple[int, int], ...]] | None = None
+        # 最后一窗 [targets[i], end] 覆盖第 i..j-1 个目标（0-based）
+        for i in range(j - 1, -1, -1):
+            start = targets[i]
+            length = end - start + 1
+            if length > max_window_length:
+                break
+            prev = dp[i]
+            assert prev is not None, "单目标窗口长度为 1，任意前缀必可达"
+            key = (
+                prev[0] + setup_cost + length,
+                prev[1] + 1,
+                prev[2] + ((start, end),),
+            )
+            if best is None or key < best:
+                best = key
+        dp[j] = best
+
+    final = dp[m]
+    assert final is not None
+    return final[0], list(final[2])
+
+
+def solve_rescan_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    """基于逐帧复核结果规划复扫窗口。
+
+    入参字段：solve_review 的全部字段，外加
+        max_window_length: int，1～50，单个窗口最多覆盖的连续帧号数
+        setup_cost: 0～1000 的数值，每开启一个窗口的固定成本
+
+    复用 solve_review 取得缺失帧号与 source=inferred 帧的指派帧号，
+    合并去重为复扫目标；把目标划分为互不重叠、长度不超过
+    max_window_length 的连续帧号窗口，每窗成本 = setup_cost + 窗口
+    帧号数，求覆盖全部目标的最低总成本；同成本依次取窗口数更少、
+    起止点序列字典序更小的方案。没有目标时返回空窗口与零成本。
+    错误语义与 solve_review 相同。
+    """
+    max_window_length = payload.get("max_window_length")
+    if (
+        not isinstance(max_window_length, int)
+        or isinstance(max_window_length, bool)
+        or not (MIN_WINDOW_LENGTH <= max_window_length <= MAX_WINDOW_LENGTH)
+    ):
+        raise InvalidRangeError(
+            f"max_window_length 必须是 "
+            f"{MIN_WINDOW_LENGTH}～{MAX_WINDOW_LENGTH} 的整数"
+        )
+    setup_cost = _to_decimal(payload.get("setup_cost"), "setup_cost", "0～1000")
+    if not (MIN_SETUP_COST <= setup_cost <= MAX_SETUP_COST):
+        raise InvalidRangeError("setup_cost 必须在 0～1000 之间")
+
+    review = solve_review(payload)
+
+    missing_numbers: list[int] = review["missing_frame_numbers"]
+    inferred_frames = [
+        (frame["assigned_frame_number"], frame["id"])
+        for frame in review["frames"]
+        if frame["source"] == "inferred"
+    ]
+
+    # 缺失帧号与推断帧号天然互斥，仍统一排序去重
+    targets = sorted(set(missing_numbers) | {num for num, _ in inferred_frames})
+
+    planned_cost, windows = _plan_windows(targets, max_window_length, setup_cost)
+
+    inferred_id_by_number = {num: frame_id for num, frame_id in inferred_frames}
+
+    result_windows: list[dict[str, Any]] = []
+    total_cost = Decimal(0)
+    covered: list[int] = []
+    for start, end in windows:
+        length = end - start + 1
+        window_cost = setup_cost + length
+        total_cost += window_cost
+        window_missing = [num for num in missing_numbers if start <= num <= end]
+        window_inferred = [
+            num for num in range(start, end + 1) if num in inferred_id_by_number
+        ]
+        covered.extend(window_missing)
+        covered.extend(window_inferred)
+        result_windows.append(
+            {
+                "start": start,
+                "end": end,
+                "length": length,
+                "cost": _json_number(window_cost),
+                "missing_frame_numbers": window_missing,
+                "inferred_frame_ids": [
+                    inferred_id_by_number[num] for num in window_inferred
+                ],
+            }
+        )
+
+    assert total_cost == planned_cost, "窗口成本合计与 DP 最优成本不一致"
+    assert sorted(covered) == targets, "窗口未完整覆盖全部复扫目标"
+
+    return {
+        "max_window_length": max_window_length,
+        "setup_cost": _json_number(setup_cost),
+        "target_frame_numbers": targets,
+        "target_count": len(targets),
+        "window_count": len(result_windows),
+        "total_cost": _json_number(total_cost),
+        "windows": result_windows,
     }
